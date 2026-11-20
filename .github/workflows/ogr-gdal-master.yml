@@ -8,7 +8,8 @@ name: OGR writer test (GDAL master)
 
 on:
     push:
-        branches: ["ci-ogr-gdal-master"]
+        # the ogr-test-* branches each carry a fix for this test
+        branches: ["ci-ogr-gdal-master", "ogr-test-*"]
     workflow_dispatch:
 
 concurrency:
