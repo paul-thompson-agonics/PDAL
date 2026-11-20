@@ -55,7 +55,8 @@ jobs:
         # gdal-master swaps libgdal-core after this, so don't save that
         # environment under the plain current environment's cache key
         cache-environment: ${{ matrix.fix != 'gdal-master' }}
-        cache-environment-key: "micromamba-env-${{ matrix.fix }}-"
+        # the key is only allowed with cache-environment on
+        cache-environment-key: ${{ matrix.fix != 'gdal-master' && format('micromamba-env-{0}-', matrix.fix) || '' }}
         cache-downloads: true
 
     - name: Hold libcurl below 8.20
