@@ -1,8 +1,9 @@
 name: COPC remote test (Windows, isolated)
 
 # Builds only pdal_io_copc_remote_reader_test with the same environment and
-# CMake setup as win.yml, then runs it alone, plainly and with GDAL curl
-# tracing, to see where the /vsicurl/ read stalls.
+# CMake setup as win.yml, then runs it alone, plainly and with curl
+# tracing, to see where the /vsicurl/ read stalls. A gdal-master job checks
+# whether GDAL's nightly build (with OSGeo/gdal#15007) fixes the hang.
 
 on:
     push:
@@ -20,7 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        type: ['current', 'fixed']
+        # gdal-master: the current environment with libgdal-core replaced
+        # by GDAL's nightly master build from the gdal-master channel
+        type: ['current', 'fixed', 'gdal-master']
     defaults:
       run:
         shell: bash -l {0}
@@ -35,9 +38,11 @@ jobs:
     - uses: mamba-org/setup-micromamba@v3
       with:
         init-shell: bash
-        environment-file: "scripts/ci/${{ matrix.type }}-environment.yml"
+        environment-file: "scripts/ci/${{ matrix.type == 'gdal-master' && 'current' || matrix.type }}-environment.yml"
         environment-name: "pdal-build"
-        cache-environment: true
+        # gdal-master shares current's cache key, so keep it from saving its
+        # modified environment under that key
+        cache-environment: ${{ matrix.type != 'gdal-master' }}
         cache-downloads: true
 
     - name: ccache
@@ -49,6 +54,12 @@ jobs:
     - name: Setup
       run: |
           source ./scripts/ci/win/setup.sh
+
+    - name: Install GDAL master nightly
+      if: matrix.type == 'gdal-master'
+      run: |
+          micromamba install -y -n pdal-build \
+              -c gdal-master -c conda-forge "libgdal-core=3.13.99"
 
     # ccache can't cache MSVC /Zi (shared PDB) compiles, so switch
     # RelWithDebInfo to /Z7 (embedded debug info). That setting needs
