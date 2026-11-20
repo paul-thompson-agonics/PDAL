@@ -44,6 +44,7 @@
 #include <io/LasReader.hpp>
 #include "Support.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 
@@ -52,6 +53,41 @@ namespace pdal
 
 namespace
 {
+
+// GDAL 3.14 appends the OGC geometry type name to ogrinfo's geometry line,
+// as in "Geometry: 3D Point (POINTZ)" (OSGeo/gdal commit 5bf6e54523). Drop
+// that suffix so the output matches the expected .ogrinfo files, which were
+// made with earlier GDAL versions. Other "(...)" suffixes, such as the one in
+// "Unknown (any)", aren't upper case and are left alone.
+std::string stripOgcGeomTypeName(const std::string& info)
+{
+    std::istringstream in(info);
+    std::string out;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.rfind("Geometry: ", 0) == 0)
+        {
+            const bool cr = !line.empty() && line.back() == '\r';
+            if (cr)
+                line.pop_back();
+            const auto open = line.rfind(" (");
+            if (open != std::string::npos && line.back() == ')' &&
+                open + 3 < line.size())
+            {
+                const std::string name =
+                    line.substr(open + 2, line.size() - open - 3);
+                if (std::all_of(name.begin(), name.end(),
+                        [](char c){ return c >= 'A' && c <= 'Z'; }))
+                    line.erase(open);
+            }
+            if (cr)
+                line += '\r';
+        }
+        out += line + '\n';
+    }
+    return out;
+}
 
 void runOgrWriterInfo(const Options& wo, const std::string& infile,
     const std::string& infofile, const std::string suffix, int featureCount = 10,
@@ -115,7 +151,7 @@ void runOgrWriterInfo(const Options& wo, const std::string& infile,
     }
 
     auto handle = FileUtils::createFile(outinfofile);
-    *handle << info;
+    *handle << stripOgcGeomTypeName(info);
     FileUtils::closeFile(handle);
 
     EXPECT_EQ(compare(infofile, outinfofile, 1), 0u) \
