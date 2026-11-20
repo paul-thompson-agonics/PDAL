@@ -1,0 +1,135 @@
+name: OGR writer test (GDAL master)
+
+# pdal_io_ogr_writer_test fails against GDAL's nightly master build (3.14dev)
+# on Windows. The test writes points with OGRWriter, runs `ogrinfo -nomd -al`
+# on the result, and compares that text with test/data/ogr/*.ogrinfo. This
+# builds only that test, runs it, and prints the ogrinfo output diffs to find
+# out what changed. The Linux job shows whether it is Windows-specific.
+
+on:
+    push:
+        branches: ["ci-ogr-gdal-master"]
+    workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ogr-writer:
+    name: OGR writer (${{ matrix.os }}, gdal-master)
+    runs-on: ${{ matrix.os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['windows', 'linux']
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      BUILD_TYPE: current
+    steps:
+    - uses: actions/checkout@v7
+    - uses: TheMrMilchmann/setup-msvc-dev@v4
+      if: matrix.os == 'windows'
+      with:
+        arch: x64
+    - uses: mamba-org/setup-micromamba@v3
+      with:
+        init-shell: bash
+        environment-file: "scripts/ci/current-environment.yml"
+        environment-name: "pdal-build"
+        # the nightly is swapped in after this, so don't save the env
+        cache-environment: false
+        cache-downloads: true
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ github.job }}-${{ matrix.os }}-gdal-master
+        max-size: 2G
+
+    - name: Setup
+      run: |
+          source ./scripts/ci/${{ matrix.os == 'windows' && 'win' || 'linux' }}/setup.sh
+
+    - name: Install GDAL master nightly
+      run: |
+          micromamba install -y -n pdal-build \
+              -c gdal-master -c conda-forge "libgdal-core=3.13.99"
+
+    - name: Versions
+      run: |
+          gdalinfo --version
+          echo "ogrinfo: $(command -v ogrinfo)"
+          ogrinfo --version
+          echo "GDAL_DRIVER_PATH=${GDAL_DRIVER_PATH:-}"
+          echo "GDAL_DATA=${GDAL_DATA:-}"
+          echo "PROJ_DATA=${PROJ_DATA:-}"
+          micromamba list -n pdal-build \
+              | grep -Ei '^\s*(libgdal|libgdal-core|proj|libcurl) ' || true
+
+    # Windows: ccache can't cache MSVC /Zi compiles, so use /Z7 instead,
+    # which needs policy CMP0141 (see win.yml)
+    - name: CMake
+      working-directory: ./build
+      run: |
+          if [ "${{ matrix.os }}" = windows ]; then
+              source ../scripts/ci/win/cmake.sh \
+                  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
+                  -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          else
+              source ../scripts/ci/linux/cmake.sh
+          fi
+
+    - name: Compile test only
+      working-directory: ./build
+      run: |
+          ccache -z
+          ninja pdal_io_ogr_writer_test
+          ccache -s
+
+    - name: Run test
+      id: test
+      continue-on-error: true
+      working-directory: ./build
+      run: |
+          ./bin/pdal_io_ogr_writer_test
+
+    # Each output is test/temp/ogr/<name>.ogrinfo, next to the expected
+    # test/data/ogr/<name>.ogrinfo. The test ignores line 1 (the file path).
+    - name: Diff ogrinfo output against expected
+      if: always()
+      run: |
+          shopt -s nullglob
+          for out in test/temp/ogr/*.ogrinfo; do
+              exp="test/data/ogr/$(basename "$out")"
+              echo "::group::$(basename "$out")"
+              if [ -f "$exp" ]; then
+                  if d=$(diff -u --strip-trailing-cr "$exp" "$out"); then
+                      echo "(no differences)"
+                  else
+                      tail -n +3 <<<"$d" | head -80
+                  fi
+              else
+                  echo "no expected file $exp; output was:"
+                  head -40 "$out"
+              fi
+              echo "::endgroup::"
+          done
+          echo "=== first output in full"
+          first=(test/temp/ogr/*.ogrinfo)
+          [ ${#first[@]} -gt 0 ] && cat -A "${first[0]}" | head -60
+
+    - name: Upload ogrinfo outputs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ogrinfo-${{ matrix.os }}
+        path: test/temp/ogr/
+
+    - name: Fail if the test failed
+      if: steps.test.outcome != 'success'
+      run: exit 1
