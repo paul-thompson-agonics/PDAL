@@ -1,0 +1,89 @@
+name: COPC remote test (Windows, isolated)
+
+# Builds only pdal_io_copc_remote_reader_test with the same environment and
+# CMake setup as win.yml, then runs it alone, plainly and with GDAL curl
+# tracing, to see where the /vsicurl/ read stalls.
+
+on:
+    push:
+        branches: ["ci-copc-win"]
+    workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  copc-remote:
+    name: COPC remote (${{ matrix.type }})
+    runs-on: 'windows-latest'
+    strategy:
+      fail-fast: false
+      matrix:
+        type: ['current', 'fixed']
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      BUILD_TYPE: ${{ matrix.type }}
+
+    steps:
+    - uses: actions/checkout@v7
+    - uses: TheMrMilchmann/setup-msvc-dev@v4
+      with:
+        arch: x64
+    - uses: mamba-org/setup-micromamba@v3
+      with:
+        init-shell: bash
+        environment-file: "scripts/ci/${{ matrix.type }}-environment.yml"
+        environment-name: "pdal-build"
+        cache-environment: true
+        cache-downloads: true
+
+    - name: Setup
+      run: |
+          source ./scripts/ci/win/setup.sh
+
+    - name: CMake
+      working-directory: ./build
+      run: |
+          source ../scripts/ci/win/cmake.sh
+
+    - name: Compile test only
+      working-directory: ./build
+      run: |
+          ninja pdal_io_copc_remote_reader_test
+
+    - name: Versions
+      run: |
+          gdalinfo --version
+          micromamba list -n pdal-build | grep -Ei '^\s*(libgdal|gdal|libcurl|curl|openssl|libssh2|zstd) ' || true
+
+    - name: Test via ctest (as in win.yml)
+      id: ctest
+      continue-on-error: true
+      timeout-minutes: 7
+      working-directory: ./build
+      run: |
+          ctest -R '^pdal_io_copc_remote_reader_test$' -VV --output-on-failure
+
+    - name: Test direct with GDAL curl tracing
+      continue-on-error: true
+      timeout-minutes: 7
+      working-directory: ./build
+      env:
+        CPL_DEBUG: "ON"
+        CPL_CURL_VERBOSE: "YES"
+      run: |
+          start=$(date +%s)
+          timeout 300 ./bin/pdal_io_copc_remote_reader_test.exe 2>&1 \
+              | while IFS= read -r line; do
+                    printf '[+%4ss] %s\n' "$(( $(date +%s) - start ))" "$line"
+                done
+          echo "exit status: ${PIPESTATUS[0]} after $(( $(date +%s) - start ))s"
+
+    - name: Fail if ctest failed
+      if: steps.ctest.outcome != 'success'
+      run: |
+          echo "ctest run of pdal_io_copc_remote_reader_test failed"
+          exit 1
