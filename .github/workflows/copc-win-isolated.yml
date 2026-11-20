@@ -40,19 +40,34 @@ jobs:
         cache-environment: true
         cache-downloads: true
 
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ github.job }}-windows-${{ matrix.type }}
+        max-size: 2G
+
     - name: Setup
       run: |
           source ./scripts/ci/win/setup.sh
 
+    # ccache can't cache MSVC /Zi (shared PDB) compiles, so switch
+    # RelWithDebInfo to /Z7 (embedded debug info). That setting needs
+    # policy CMP0141, which PDAL's cmake_minimum_required(3.13) leaves unset.
     - name: CMake
       working-directory: ./build
       run: |
-          source ../scripts/ci/win/cmake.sh
+          source ../scripts/ci/win/cmake.sh \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
+              -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
     - name: Compile test only
       working-directory: ./build
       run: |
+          ccache -z
           ninja pdal_io_copc_remote_reader_test
+          ccache -s
 
     - name: Versions
       run: |
@@ -67,13 +82,16 @@ jobs:
       run: |
           ctest -R '^pdal_io_copc_remote_reader_test$' -VV --output-on-failure
 
-    - name: Test direct with GDAL curl tracing
+    # CPL_* traces GDAL's /vsicurl/ read; ARBITER_VERBOSE traces the plain
+    # https:// read, which goes through PDAL's vendored arbiter instead.
+    - name: Test direct with curl tracing
       continue-on-error: true
       timeout-minutes: 7
       working-directory: ./build
       env:
         CPL_DEBUG: "ON"
         CPL_CURL_VERBOSE: "YES"
+        ARBITER_VERBOSE: "1"
       run: |
           start=$(date +%s)
           timeout 300 ./bin/pdal_io_copc_remote_reader_test.exe 2>&1 \
