@@ -33,4 +33,5 @@ cmake .. -G "Ninja" \
     -DHDF5_DIR:FILEPATH="$CONDA_PREFIX/Library/cmake" \
     -DWITH_ZLIB=ON \
     -Dgtest_force_shared_crt=ON \
-    -DBUILD_PGPOINTCLOUD_TESTS=OFF
+    -DBUILD_PGPOINTCLOUD_TESTS=OFF \
+    "$@"

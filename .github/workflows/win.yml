@@ -17,15 +17,24 @@ concurrency:
 
 jobs:
   build:
-    name: MSVC
+    name: MSVC (${{ matrix.type }}, ${{ matrix.fix }})
 
     runs-on: 'windows-latest'
     if: "!contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[skip ci]')"
 
+    # GDAL < 3.13.4 hangs on Windows at exit with libcurl >= 8.20 (fixed by
+    # OSGeo/gdal#15007). Two ways around it, one per environment:
+    # - current + gdal-master: replace libgdal-core with GDAL's nightly build
+    # - fixed + curl-pin: hold libcurl < 8.20. Every conda-forge GDAL 3.13
+    #   build needs libcurl >= 8.21, so this only works with GDAL 3.12.
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        type: ['current','fixed']
+        include:
+          - type: current
+            fix: gdal-master
+          - type: fixed
+            fix: curl-pin
     defaults:
       run:
         shell: bash -l {0}
@@ -42,18 +51,52 @@ jobs:
         init-shell: bash
         environment-file: "scripts/ci/${{ matrix.type }}-environment.yml"
         environment-name: "pdal-build"
-        cache-environment: true
+        create-args: ${{ matrix.fix == 'curl-pin' && 'libcurl<8.20' || '' }}
+        # gdal-master swaps libgdal-core after this, so don't save that
+        # environment under the plain current environment's cache key
+        cache-environment: ${{ matrix.fix != 'gdal-master' }}
+        cache-environment-key: "micromamba-env-${{ matrix.fix }}-"
         cache-downloads: true
 
+    - name: Hold libcurl below 8.20
+      if: matrix.fix == 'curl-pin'
+      run: |
+          # keeps later installs (setup.sh) from upgrading it
+          echo "libcurl <8.20" >> "$CONDA_PREFIX/conda-meta/pinned"
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ github.job }}-windows-${{ matrix.type }}-${{ matrix.fix }}
+        max-size: 2G
 
     - name: Setup
       run: |
           source ./scripts/ci/win/setup.sh
 
+    - name: Install GDAL master nightly
+      if: matrix.fix == 'gdal-master'
+      run: |
+          micromamba install -y -n pdal-build \
+              -c gdal-master -c conda-forge "libgdal-core=3.13.99"
+
+    - name: Versions
+      run: |
+          gdalinfo --version
+          micromamba list -n pdal-build \
+              | grep -Ei '^\s*(libgdal|libgdal-core|libcurl|curl) ' || true
+
+    # ccache can't cache MSVC /Zi (shared PDB) compiles, so switch
+    # RelWithDebInfo to /Z7 (embedded debug info). That setting needs
+    # policy CMP0141, which PDAL's cmake_minimum_required(3.13) leaves unset.
     - name: CMake
       working-directory: ./build
       run: |
-          source ../scripts/ci/win/cmake.sh
+          source ../scripts/ci/win/cmake.sh \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_POLICY_DEFAULT_CMP0141=NEW \
+              -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
     - name: Compile
       working-directory: ./build
