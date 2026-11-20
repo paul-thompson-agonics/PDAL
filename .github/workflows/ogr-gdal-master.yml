@@ -105,7 +105,13 @@ jobs:
       if: always()
       run: |
           shopt -s nullglob
-          for out in test/temp/ogr/*.ogrinfo; do
+          outs=(test/temp/ogr/*.ogrinfo)
+          if [ ${#outs[@]} -eq 0 ]; then
+              # the GDAL API version of the test writes no ogrinfo output
+              echo "No ogrinfo output to compare"
+              exit 0
+          fi
+          for out in "${outs[@]}"; do
               exp="test/data/ogr/$(basename "$out")"
               echo "::group::$(basename "$out")"
               if [ -f "$exp" ]; then
@@ -121,8 +127,7 @@ jobs:
               echo "::endgroup::"
           done
           echo "=== first output in full"
-          first=(test/temp/ogr/*.ogrinfo)
-          [ ${#first[@]} -gt 0 ] && cat -A "${first[0]}" | head -60
+          cat -A "${outs[0]}" | head -60
 
     - name: Upload ogrinfo outputs
       if: always()
