@@ -11,6 +11,9 @@ on:
         # Mondays at 06:17 UTC
         - cron: '17 6 * * 1'
     workflow_dispatch:
+    # FORK TESTING ONLY, drop before the upstream PR
+    push:
+        branches: ["gdal-master-ci"]
 
 permissions:
     contents: read
