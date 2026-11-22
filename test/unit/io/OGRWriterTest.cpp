@@ -44,8 +44,13 @@
 #include <io/LasReader.hpp>
 #include "Support.hpp"
 
+#include <gdal_priv.h>
+#include <ogrsf_frmts.h>
+
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 namespace pdal
 {
@@ -53,7 +58,8 @@ namespace pdal
 namespace
 {
 
-void runOgrWriterInfo(const Options& wo, const std::string& infile,
+// Returns the path written
+std::string runOgrWriterInfo(const Options& wo, const std::string& infile,
     const std::string& infofile, const std::string suffix, int featureCount = 10,
     uint32_t(*compare)(const std::string&, const std::string&, int32_t) = &Support::diff_text_files
 )
@@ -111,7 +117,7 @@ void runOgrWriterInfo(const Options& wo, const std::string& infile,
     std::string info;
     if (Utils::run_shell_command(cmd, info)) {
         std::cerr << "WARNING: error running ogrinfo, skipping test" << std::endl;
-        return;
+        return outfile;
     }
 
     auto handle = FileUtils::createFile(outinfofile);
@@ -120,6 +126,7 @@ void runOgrWriterInfo(const Options& wo, const std::string& infile,
 
     EXPECT_EQ(compare(infofile, outinfofile, 1), 0u) \
         << "  (" << infofile << " <-> " << outinfofile << ")";
+    return outfile;
 }
 
 uint32_t diff_geojson(const std::string& file1, const std::string& file2, int32_t ignoreLine1=-1)
@@ -222,7 +229,135 @@ uint32_t diff_geojson(const std::string& file1, const std::string& file2, int32_
     return numdiffs;
 }
 
+struct Field
+{
+    std::string name;
+    OGRFieldType type;
+    double value;  // in the first feature
+};
+
+struct Expected
+{
+    OGRwkbGeometryType geomType;
+    GIntBig featureCount;
+    OGREnvelope extent;
+    // X, Y, Z of the first point of the first feature, plus M when the
+    // geometry should be measured
+    std::vector<double> firstPoint;
+    // the fields writers.ogr should create, in order
+    std::vector<Field> fields;
+    // points in each feature, for multipoint layers
+    std::vector<int> pointsPerFeature;
+    // nullptr: don't check the SRS; "": there should be none
+    const char *srsName;
+};
+
+OGREnvelope envelope(double minx, double miny, double maxx, double maxy)
+{
+    OGREnvelope env;
+    env.MinX = minx;
+    env.MinY = miny;
+    env.MaxX = maxx;
+    env.MaxY = maxy;
+    return env;
 }
+
+void checkLayer(const std::string& filename, const Expected& exp)
+{
+    GDALDatasetUniquePtr ds(GDALDataset::Open(filename.c_str(),
+        GDAL_OF_VECTOR | GDAL_OF_READONLY));
+    ASSERT_TRUE(ds) << "can't open " << filename;
+    ASSERT_EQ(ds->GetLayerCount(), 1);
+    OGRLayer *layer = ds->GetLayer(0);
+
+    EXPECT_EQ(layer->GetGeomType(), exp.geomType)
+        << "got " << OGRGeometryTypeToName(layer->GetGeomType())
+        << ", expected " << OGRGeometryTypeToName(exp.geomType);
+    EXPECT_EQ(layer->GetFeatureCount(TRUE), exp.featureCount);
+
+    OGREnvelope env;
+    ASSERT_EQ(layer->GetExtent(&env, TRUE), OGRERR_NONE);
+    EXPECT_NEAR(env.MinX, exp.extent.MinX, 1e-6);
+    EXPECT_NEAR(env.MinY, exp.extent.MinY, 1e-6);
+    EXPECT_NEAR(env.MaxX, exp.extent.MaxX, 1e-6);
+    EXPECT_NEAR(env.MaxY, exp.extent.MaxY, 1e-6);
+
+    if (exp.srsName)
+    {
+        const OGRSpatialReference *srs = layer->GetSpatialRef();
+        if (*exp.srsName == '\0')
+            EXPECT_EQ(srs, nullptr) << "unexpected SRS " << srs->GetName();
+        else
+        {
+            ASSERT_NE(srs, nullptr);
+            EXPECT_STREQ(srs->GetName(), exp.srsName);
+        }
+    }
+
+    // A Shapefile needs at least one field, so the driver adds "FID" to a
+    // layer without any. That's not from writers.ogr, so skip it.
+    OGRFeatureDefn *defn = layer->GetLayerDefn();
+    std::vector<std::pair<std::string, OGRFieldType>> fields;
+    for (int i = 0; i < defn->GetFieldCount(); ++i)
+    {
+        OGRFieldDefn *fd = defn->GetFieldDefn(i);
+        if (std::string(fd->GetNameRef()) != "FID")
+            fields.emplace_back(fd->GetNameRef(), fd->GetType());
+    }
+    ASSERT_EQ(fields.size(), exp.fields.size());
+    for (size_t i = 0; i < fields.size(); ++i)
+    {
+        EXPECT_EQ(fields[i].first, exp.fields[i].name);
+        EXPECT_EQ(fields[i].second, exp.fields[i].type)
+            << "field " << fields[i].first;
+    }
+
+    layer->ResetReading();
+    OGRFeatureUniquePtr feat(layer->GetNextFeature());
+    ASSERT_TRUE(feat);
+    for (const Field& f : exp.fields)
+        EXPECT_NEAR(feat->GetFieldAsDouble(f.name.c_str()), f.value, 1e-6)
+            << "field " << f.name;
+
+    const OGRGeometry *geom = feat->GetGeometryRef();
+    ASSERT_NE(geom, nullptr);
+    const OGRPoint *pt;
+    if (wkbFlatten(geom->getGeometryType()) == wkbMultiPoint)
+    {
+        const OGRMultiPoint *mp = geom->toMultiPoint();
+        ASSERT_GT(mp->getNumGeometries(), 0);
+        pt = mp->getGeometryRef(0);
+    }
+    else
+    {
+        ASSERT_EQ(wkbFlatten(geom->getGeometryType()), wkbPoint);
+        pt = geom->toPoint();
+    }
+    ASSERT_TRUE(exp.firstPoint.size() == 3 || exp.firstPoint.size() == 4);
+    EXPECT_NEAR(pt->getX(), exp.firstPoint[0], 1e-6);
+    EXPECT_NEAR(pt->getY(), exp.firstPoint[1], 1e-6);
+    EXPECT_TRUE(pt->Is3D());
+    EXPECT_NEAR(pt->getZ(), exp.firstPoint[2], 1e-6);
+    EXPECT_EQ(pt->IsMeasured(), exp.firstPoint.size() == 4);
+    if (exp.firstPoint.size() == 4)
+        EXPECT_NEAR(pt->getM(), exp.firstPoint[3], 1e-6);
+
+    if (exp.pointsPerFeature.size())
+    {
+        std::vector<int> counts;
+        layer->ResetReading();
+        for (auto& f : *layer)
+        {
+            const OGRGeometry *g = f->GetGeometryRef();
+            ASSERT_NE(g, nullptr);
+            ASSERT_EQ(wkbFlatten(g->getGeometryType()), wkbMultiPoint);
+            counts.push_back(g->toMultiPoint()->getNumGeometries());
+        }
+        EXPECT_EQ(counts, exp.pointsPerFeature);
+    }
+}
+
+} // unnamed namespace
 
 TEST(OGRWriterTest, shapefile)
 {
@@ -232,7 +367,13 @@ TEST(OGRWriterTest, shapefile)
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbPoint25D, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        {},
+        {},
+        "" });
 }
 
 TEST(OGRWriterTest, json)
@@ -243,7 +384,14 @@ TEST(OGRWriterTest, json)
     Options wo;
     wo.add("ogrdriver", "GeoJSON");
 
-    runOgrWriterInfo(wo, infile, infofile, ".geojson", 10, &diff_geojson);
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson", 10,
+        &diff_geojson);
+    checkLayer(out, { wkbPoint25D, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        {},
+        {},
+        "WGS 84" });
 }
 
 TEST(OGRWriterTest, geopackage)
@@ -254,7 +402,13 @@ TEST(OGRWriterTest, geopackage)
     Options wo;
     wo.add("ogrdriver", "GPKG");
 
-    runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+    checkLayer(out, { wkbPointZM, 1,
+        envelope(470692.44, 4602888.9, 470692.44, 4602888.9),
+        { 470692.44, 4602888.9, 16 },
+        {},
+        {},
+        "NAD83 / UTM zone 15N" });
 }
 
 TEST(OGRWriterTest, creation_options)
@@ -271,7 +425,16 @@ TEST(OGRWriterTest, creation_options)
         wo.add("ogr_options", "WRITE_BBOX=YES");
         wo.add("ogr_options", "COORDINATE_PRECISION=1");
 
-        runOgrWriterInfo(wo, infile, infofile, ".geojson", 10, &diff_geojson);
+        std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson",
+            10, &diff_geojson);
+
+    // both .ogrinfo files give these values
+    checkLayer(out, { wkbPoint25D, 10,
+        envelope(635619.8, 849017.3, 635685.3, 852165.1),
+        { 635619.8, 850064, 447 },
+        {},
+        {},
+        "WGS 84" });
 }
 
 TEST(OGRWriterTest, shapefile_measure)
@@ -283,7 +446,13 @@ TEST(OGRWriterTest, shapefile_measure)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("measure_dim", "Classification");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbPointZM, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01, 1 },
+        {},
+        {},
+        "" });
 }
 
 TEST(OGRWriterTest, attrs_all)
@@ -295,7 +464,29 @@ TEST(OGRWriterTest, attrs_all)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("attr_dims", "all");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbPoint25D, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        { { "Intensity", OFTInteger, 1 },
+          { "ReturnNumb", OFTInteger, 1 },
+          { "NumberOfRe", OFTInteger, 2 },
+          { "ScanDirect", OFTInteger, 0 },
+          { "EdgeOfFlig", OFTInteger, 0 },
+          { "Classifica", OFTInteger, 1 },
+          { "Synthetic", OFTInteger, 0 },
+          { "KeyPoint", OFTInteger, 0 },
+          { "Withheld", OFTInteger, 0 },
+          { "Overlap", OFTInteger, 0 },
+          { "ScanAngleR", OFTReal, 15 },
+          { "UserData", OFTInteger, 125 },
+          { "PointSourc", OFTInteger, 7327 },
+          { "GpsTime", OFTReal, 246092.20788099366473 },
+          { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 },
+          { "Blue", OFTInteger, 68 } },
+        {},
+        "" });
 }
 
 TEST(OGRWriterTest, geopackage_attrs_all)
@@ -313,7 +504,54 @@ TEST(OGRWriterTest, geopackage_attrs_all)
     wo.add("ogrdriver", "GPKG");
     wo.add("attr_dims", "all");
 
-    runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3,9,0)
+    checkLayer(out, { wkbPointZM, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        { { "Intensity", OFTInteger, 1 },
+          { "ReturnNumber", OFTInteger, 1 },
+          { "NumberOfReturns", OFTInteger, 2 },
+          { "ScanDirectionFlag", OFTInteger, 0 },
+          { "EdgeOfFlightLine", OFTInteger, 0 },
+          { "Classification", OFTInteger, 1 },
+          { "Synthetic", OFTInteger, 0 },
+          { "KeyPoint", OFTInteger, 0 },
+          { "Withheld", OFTInteger, 0 },
+          { "Overlap", OFTInteger, 0 },
+          { "ScanAngleRank", OFTReal, 15 },
+          { "UserData", OFTInteger, 125 },
+          { "PointSourceId", OFTInteger, 7327 },
+          { "GpsTime", OFTReal, 246092.207880994 },
+          { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 },
+          { "Blue", OFTInteger, 68 } },
+        {},
+        "" });
+#else
+    checkLayer(out, { wkbPointZM, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        { { "Intensity", OFTInteger, 1 },
+          { "ReturnNumber", OFTInteger, 1 },
+          { "NumberOfReturns", OFTInteger, 2 },
+          { "ScanDirectionFlag", OFTInteger, 0 },
+          { "EdgeOfFlightLine", OFTInteger, 0 },
+          { "Classification", OFTInteger, 1 },
+          { "Synthetic", OFTInteger, 0 },
+          { "KeyPoint", OFTInteger, 0 },
+          { "Withheld", OFTInteger, 0 },
+          { "Overlap", OFTInteger, 0 },
+          { "ScanAngleRank", OFTReal, 15 },
+          { "UserData", OFTInteger, 125 },
+          { "PointSourceId", OFTInteger, 7327 },
+          { "GpsTime", OFTReal, 246092.207880994 },
+          { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 },
+          { "Blue", OFTInteger, 68 } },
+        {},
+        "Undefined geographic SRS" });
+#endif
 }
 
 TEST(OGRWriterTest, attrs)
@@ -325,7 +563,16 @@ TEST(OGRWriterTest, attrs)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("attr_dims", "Classification,Red,Green,Blue");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbPoint25D, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        { { "Classifica", OFTInteger, 1 },
+          { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 },
+          { "Blue", OFTInteger, 68 } },
+        {},
+        "" });
 }
 
 TEST(OGRWriterTest, attrs_measure)
@@ -338,7 +585,28 @@ TEST(OGRWriterTest, attrs_measure)
     wo.add("measure_dim", "Classification");
     wo.add("attr_dims", "all");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbPointZM, 10,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01, 1 },
+        { { "Intensity", OFTInteger, 1 },
+          { "ReturnNumb", OFTInteger, 1 },
+          { "NumberOfRe", OFTInteger, 2 },
+          { "ScanDirect", OFTInteger, 0 },
+          { "EdgeOfFlig", OFTInteger, 0 },
+          { "Synthetic", OFTInteger, 0 },
+          { "KeyPoint", OFTInteger, 0 },
+          { "Withheld", OFTInteger, 0 },
+          { "Overlap", OFTInteger, 0 },
+          { "ScanAngleR", OFTReal, 15 },
+          { "UserData", OFTInteger, 125 },
+          { "PointSourc", OFTInteger, 7327 },
+          { "GpsTime", OFTReal, 246092.20788099366473 },
+          { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 },
+          { "Blue", OFTInteger, 68 } },
+        {},
+        "" });
 }
 
 TEST(OGRWriterTest, multicount)
@@ -350,7 +618,13 @@ TEST(OGRWriterTest, multicount)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "3");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbMultiPoint25D, 4,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        {},
+        { 3, 3, 3, 1 },
+        "" });
 }
 
 TEST(OGRWriterTest, multicount_2)
@@ -363,7 +637,13 @@ TEST(OGRWriterTest, multicount_2)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "20");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbMultiPoint25D, 1,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        {},
+        { 10 },
+        "" });
 }
 
 TEST(OGRWriterTest, multicount_3)
@@ -376,7 +656,13 @@ TEST(OGRWriterTest, multicount_3)
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "5");
 
-    runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    checkLayer(out, { wkbMultiPoint25D, 2,
+        envelope(635619.85, 849017.32, 635685.33, 852165.12),
+        { 635619.85, 850064.04, 447.01 },
+        {},
+        { 5, 5 },
+        "" });
 }
 
 TEST(OGRWriterTest, error_multicount_attrs)
