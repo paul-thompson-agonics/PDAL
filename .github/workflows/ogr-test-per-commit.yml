@@ -1,0 +1,112 @@
+name: OGRWriterTest per commit
+
+# FORK TESTING ONLY, drop before the upstream PR.
+#
+# Builds and runs pdal_io_ogr_writer_test at the base commit and at each
+# commit on this branch that changes the test, against released GDAL and
+# GDAL master. With released GDAL every commit should pass. With GDAL
+# master, the commits that still compare ogrinfo text should fail and the
+# last one should pass.
+
+on:
+    push:
+        branches: ["gdal-master-ci"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  per-commit:
+    name: OGRWriterTest per commit (GDAL ${{ matrix.gdal }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gdal: ['release', 'master']
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      BUILD_TYPE: current
+      # upstream master that the branch is based on
+      BASE: a6c53218491a0a42240471a5595457beff79e2a7
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - uses: mamba-org/setup-micromamba@v3
+      with:
+        init-shell: bash
+        environment-file: "scripts/ci/current-environment.yml"
+        environment-name: "pdal-build"
+        cache-environment: false
+        cache-downloads: true
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ github.job }}-${{ matrix.gdal }}
+
+    - name: Setup
+      run: |
+          source ./scripts/ci/linux/setup.sh
+
+    - name: Install GDAL master nightly
+      if: matrix.gdal == 'master'
+      run: |
+          micromamba install -y -n pdal-build \
+              -c gdal-master -c conda-forge "gdal-master::libgdal-core"
+
+    - name: Versions
+      run: |
+          gdalinfo --version
+          echo "ogrinfo: $(command -v ogrinfo)"
+
+    - name: CMake
+      working-directory: ./build
+      run: |
+          source ../scripts/ci/linux/cmake.sh
+
+    - name: Build and run the test at each commit
+      working-directory: ./build
+      run: |
+          head=$(git rev-parse HEAD)
+          commits=("$BASE" $(git rev-list --reverse "$BASE..HEAD" -- \
+              test/unit/io/OGRWriterTest.cpp test/data/ogr))
+          {
+              echo "### OGRWriterTest per commit, GDAL ${{ matrix.gdal }}"
+              echo
+              echo "$(gdalinfo --version)"
+              echo
+              echo "| Commit | Result |"
+              echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          anyfail=0
+          lastfail=0
+          for c in "${commits[@]}"; do
+              git checkout -q --detach "$c"
+              title=$(git log -1 --format='%h %s' "$c")
+              echo "::group::$title"
+              if ninja pdal_io_ogr_writer_test \
+                  && ./bin/pdal_io_ogr_writer_test; then
+                  result=pass
+                  lastfail=0
+              else
+                  result=FAIL
+                  anyfail=1
+                  lastfail=1
+              fi
+              echo "::endgroup::"
+              echo "$result: $title"
+              echo "| \`$title\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          git checkout -q --detach "$head"
+          if [ "${{ matrix.gdal }}" = release ] && [ $anyfail = 1 ]; then
+              echo "A commit failed with released GDAL"
+              exit 1
+          fi
+          if [ $lastfail = 1 ]; then
+              echo "The last commit failed"
+              exit 1
+          fi
