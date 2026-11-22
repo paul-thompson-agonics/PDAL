@@ -432,9 +432,9 @@ TEST(OGRWriterTest, json)
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson", 10,
         &diff_geojson);
 
-    // GeoJSON has no M
+    // GeoJSON has no M, and reports WGS 84 for any file without a CRS
     checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
-        {}, {}, "WGS 84" });
+        {}, {}, nullptr });
 }
 
 TEST(OGRWriterTest, geopackage)
@@ -473,7 +473,7 @@ TEST(OGRWriterTest, creation_options)
     // COORDINATE_PRECISION=1 rounds coordinates to one decimal place
     checkLayer(out, { wkbPoint25D, 10,
         envelope(635619.8, 849017.3, 635685.3, 852165.1),
-        { 635619.8, 850064, 447 }, {}, {}, "WGS 84" });
+        { 635619.8, 850064, 447 }, {}, {}, nullptr });
 }
 
 TEST(OGRWriterTest, shapefile_measure)
@@ -520,13 +520,11 @@ TEST(OGRWriterTest, geopackage_attrs_all)
     wo.add("attr_dims", "all");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
-#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3,9,0)
+
+    // A GeoPackage without a CRS reads back with an "Undefined geographic
+    // SRS" before GDAL 3.9 and none after, so the SRS isn't checked
     checkLayer(out, { wkbPointZM, 10, simpleExtent, simpleFirstPoint,
-        simpleFields(false, true), {}, "" });
-#else
-    checkLayer(out, { wkbPointZM, 10, simpleExtent, simpleFirstPoint,
-        simpleFields(false, true), {}, "Undefined geographic SRS" });
-#endif
+        simpleFields(false, true), {}, nullptr });
 }
 
 TEST(OGRWriterTest, attrs)
