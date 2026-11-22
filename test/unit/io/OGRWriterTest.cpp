@@ -36,10 +36,7 @@
 #include <pdal/util/FileUtils.hpp>
 #include <pdal/private/gdal/ErrorHandler.hpp>
 #include <filters/HeadFilter.hpp>
-#include <filters/RangeFilter.hpp>
 #include <filters/SortFilter.hpp>
-#include <io/BufferReader.hpp>
-#include <io/FauxReader.hpp>
 #include <io/OGRWriter.hpp>
 #include <io/LasReader.hpp>
 #include "Support.hpp"
@@ -47,10 +44,14 @@
 #include <gdal_priv.h>
 #include <ogrsf_frmts.h>
 
-#include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
+
+// These tests write points with writers.ogr, then open the result with GDAL
+// and check the layer and its features: geometry type, feature count,
+// extent, SRS, fields, and the first feature's values. They used to compare
+// ogrinfo's text output with stored copies instead, which broke whenever
+// GDAL or PROJ changed how ogrinfo prints things.
 
 namespace pdal
 {
@@ -58,175 +59,48 @@ namespace pdal
 namespace
 {
 
-// Returns the path written
-std::string runOgrWriterInfo(const Options& wo, const std::string& infile,
-    const std::string& infofile, const std::string suffix, int featureCount = 10,
-    uint32_t(*compare)(const std::string&, const std::string&, int32_t) = &Support::diff_text_files
-)
+// Writes the first featureCount points of infile, sorted by X, to
+// temp/ogr/<name> with writers.ogr and the given options, and returns the
+// path written.
+std::string writeOgr(const Options& wo, const std::string& infile,
+    const std::string& name, int featureCount = 10)
 {
     FileUtils::createDirectory(Support::temppath("ogr"));
-    std::string outfile(Support::temppath(std::string("ogr/") + FileUtils::stem(FileUtils::stem(FileUtils::getFilename(infofile))) + suffix));
-    std::string outinfofile(outfile + ".ogrinfo");
-
-    if(FileUtils::isDirectory(outfile)) {
+    std::string outfile(Support::temppath("ogr/" + name));
+    if (FileUtils::isDirectory(outfile))
         FileUtils::deleteDirectory(outfile);
-    } else {
+    else
         FileUtils::deleteFile(outfile);
-    }
-    FileUtils::deleteFile(outinfofile);
 
     Options readerOpts;
     readerOpts.add("filename", infile);
-
     LasReader reader;
     reader.setOptions(readerOpts);
 
     Options sortOpts;
-    SortFilter sortFilter;
     sortOpts.add("dimension", "X");
+    SortFilter sortFilter;
     sortFilter.setOptions(sortOpts);
     sortFilter.setInput(reader);
 
+    Options headOpts;
+    headOpts.add("count", featureCount);
+    HeadFilter headFilter;
+    headFilter.setOptions(headOpts);
+    headFilter.setInput(sortFilter);
+
     Options writerOpts;
     writerOpts.add("filename", outfile);
-
     OGRWriter writer;
     writer.setOptions(wo);
     writer.addOptions(writerOpts);
-
-    HeadFilter headFilter;
-    if (featureCount > 0) {
-        Options headOpts;
-        headOpts.add("count", featureCount);
-        headFilter.setOptions(headOpts);
-        headFilter.setInput(sortFilter);
-        writer.setInput(headFilter);
-    } else {
-        writer.setInput(sortFilter);
-    }
+    writer.setInput(headFilter);
 
     PointTable t;
     writer.prepare(t);
     writer.execute(t);
 
-    std::string cmd = "ogrinfo -nomd -al " + outfile;
-    if (featureCount == 0) {
-        cmd += " -so";
-    }
-    cmd += " 2>&1";
-    std::string info;
-    if (Utils::run_shell_command(cmd, info)) {
-        std::cerr << "WARNING: error running ogrinfo, skipping test" << std::endl;
-        return outfile;
-    }
-
-    auto handle = FileUtils::createFile(outinfofile);
-    *handle << info;
-    FileUtils::closeFile(handle);
-
-    EXPECT_EQ(compare(infofile, outinfofile, 1), 0u) \
-        << "  (" << infofile << " <-> " << outinfofile << ")";
     return outfile;
-}
-
-uint32_t diff_geojson(const std::string& file1, const std::string& file2, int32_t ignoreLine1=-1)
-{
-    // GeoJSON files depend on PROJ version, later versions write a much different
-    // SRS format. Crudely ignore lines between ^GEOGCRS[ and ^OGRFeature
-
-    if (!Utils::fileExists(file1) || !Utils::fileExists(file2))
-        return (std::numeric_limits<uint32_t>::max)();
-    if (!Utils::fileExists(file1) || !Utils::fileExists(file2))
-        return (std::numeric_limits<uint32_t>::max)();
-
-    std::istream *istr1 = Utils::openFile(file1, false);
-    std::istream *istr2 = Utils::openFile(file2, false);
-    std::istream& str1 = *istr1;
-    std::istream& str2 = *istr2;
-
-    uint32_t numdiffs = 0;
-    int32_t currLine = 1;
-    bool buf1ignore = false;
-    bool buf2ignore = false;
-    std::string buf1;
-    std::string buf2;
-
-    while (!str1.eof() && !str2.eof())
-    {
-        if (currLine == ignoreLine1)
-        {
-            std::getline(str1, buf1);
-            std::getline(str2, buf2);
-            ++currLine;
-            continue;
-        }
-
-        if (!(buf1ignore ^ buf2ignore))
-        {
-            std::getline(str1, buf1);
-            std::getline(str2, buf2);
-        }
-        else if (!buf2ignore)
-            std::getline(str1, buf1);
-        else if (!buf1ignore)
-            std::getline(str2, buf2);
-
-        // EOF handling won't work properly if we're in an ignored block. NBD
-        if (str1.eof() && str2.eof())
-        {
-            // hit end on both together
-            break;
-        }
-        else if (str1.eof() && !str2.eof())
-        {
-            // str1 ended, but str2 still going
-            while (!str2.eof())
-            {
-                std::getline(str2, buf2);
-                ++numdiffs;
-            }
-            break;
-        }
-        else if (!str1.eof() && str2.eof())
-        {
-            // str2 ended, but str1 still going
-            while (!str1.eof())
-            {
-                std::getline(str1, buf1);
-                ++numdiffs;
-            }
-            break;
-        }
-
-        if (buf1ignore && buf1.rfind("OGRFeature", 0) == 0)
-            buf1ignore = false;
-        else if (buf1.rfind("GEOGCRS[", 0) == 0)
-            buf1ignore = true;
-
-        if (buf2ignore && buf2.rfind("OGRFeature", 0) == 0)
-            buf2ignore = false;
-        else if (buf2.rfind("GEOGCRS[", 0) == 0)
-            buf2ignore = true;
-
-        // remove line endings from test comparisons
-        buf1.erase(std::remove(buf1.begin(), buf1.end(), '\r' ), buf1.end());
-        buf1.erase(std::remove(buf1.begin(), buf1.end(), '\n' ), buf1.end());
-        buf2.erase(std::remove(buf2.begin(), buf2.end(), '\r' ), buf2.end());
-        buf2.erase(std::remove(buf2.begin(), buf2.end(), '\n' ), buf2.end());
-
-        if (!buf1ignore && !buf2ignore && buf1 != buf2)
-            ++numdiffs;
-
-        ++currLine;
-    }
-
-    assert(str1.eof());
-    assert(str2.eof());
-
-    Utils::closeFile(istr1);
-    Utils::closeFile(istr2);
-
-    return numdiffs;
 }
 
 struct Field
@@ -407,13 +281,10 @@ void checkLayer(const std::string& filename, const Expected& exp)
 
 TEST(OGRWriterTest, shapefile)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/shapefile.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "shapefile.shp");
 
     // writers.ogr creates the layer as Point ZM, but a Shapefile reports M
     // only if the features have M values
@@ -423,14 +294,10 @@ TEST(OGRWriterTest, shapefile)
 
 TEST(OGRWriterTest, json)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/json.geojson.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "GeoJSON");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson", 10,
-        &diff_geojson);
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "json.geojson");
 
     // GeoJSON has no M, and reports WGS 84 for any file without a CRS
     checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
@@ -439,13 +306,10 @@ TEST(OGRWriterTest, json)
 
 TEST(OGRWriterTest, geopackage)
 {
-    std::string infile = Support::datapath("las/utm15.las");
-    std::string infofile = Support::datapath("ogr/geopackage.gpkg.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "GPKG");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+    std::string out = writeOgr(wo, Support::datapath("las/utm15.las"),
+        "geopackage.gpkg");
 
     // GeoPackage keeps the layer's Point ZM type
     checkLayer(out, { wkbPointZM, 1,
@@ -455,20 +319,12 @@ TEST(OGRWriterTest, geopackage)
 
 TEST(OGRWriterTest, creation_options)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    #if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3,9,0)
-        std::string infofile = Support::datapath("ogr/creation_options_gdal_gt_390.geojson.ogrinfo");
-    #else
-        std::string infofile = Support::datapath("ogr/creation_options.geojson.ogrinfo");
-    #endif
-
-        Options wo;
-        wo.add("ogrdriver", "GeoJSON");
-        wo.add("ogr_options", "WRITE_BBOX=YES");
-        wo.add("ogr_options", "COORDINATE_PRECISION=1");
-
-        std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson",
-            10, &diff_geojson);
+    Options wo;
+    wo.add("ogrdriver", "GeoJSON");
+    wo.add("ogr_options", "WRITE_BBOX=YES");
+    wo.add("ogr_options", "COORDINATE_PRECISION=1");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "creation_options.geojson");
 
     // COORDINATE_PRECISION=1 rounds coordinates to one decimal place
     checkLayer(out, { wkbPoint25D, 10,
@@ -482,48 +338,35 @@ TEST(OGRWriterTest, creation_options)
 
 TEST(OGRWriterTest, shapefile_measure)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/shapefile_measure.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("measure_dim", "Classification");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "shapefile_measure.shp");
 
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
     checkLayer(out, { wkbPointZM, 10, simpleExtent,
         { 635619.85, 850064.04, 447.01, 1 }, {}, {}, "" });
 }
 
 TEST(OGRWriterTest, attrs_all)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/attrs_all.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("attr_dims", "all");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "attrs_all.shp");
 
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
     checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
         simpleFields(true, true), {}, "" });
 }
 
 TEST(OGRWriterTest, geopackage_attrs_all)
 {
-    std::string infile = Support::datapath("las/simple.las");
-
-    #if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3,9,0)
-        std::string infofile = Support::datapath("ogr/geopackage_attrs_all_gdal_gt_390.gpkg.ogrinfo");
-    #else
-        std::string infofile = Support::datapath("ogr/geopackage_attrs_all.gpkg.ogrinfo");
-    #endif
-
-
     Options wo;
     wo.add("ogrdriver", "GPKG");
     wo.add("attr_dims", "all");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "geopackage_attrs_all.gpkg");
 
     // A GeoPackage without a CRS reads back with an "Undefined geographic
     // SRS" before GDAL 3.9 and none after, so the SRS isn't checked
@@ -533,14 +376,12 @@ TEST(OGRWriterTest, geopackage_attrs_all)
 
 TEST(OGRWriterTest, attrs)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/attrs.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("attr_dims", "Classification,Red,Green,Blue");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "attrs.shp");
 
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
     checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
         { { "Classifica", OFTInteger, 1 }, { "Red", OFTInteger, 52 },
           { "Green", OFTInteger, 65 }, { "Blue", OFTInteger, 68 } },
@@ -549,15 +390,12 @@ TEST(OGRWriterTest, attrs)
 
 TEST(OGRWriterTest, attrs_measure)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/attrs_measure.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("measure_dim", "Classification");
     wo.add("attr_dims", "all");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "attrs_measure.shp");
 
     // "all" leaves out the measure dimension, as it's already the M value
     checkLayer(out, { wkbPointZM, 10, simpleExtent,
@@ -567,14 +405,11 @@ TEST(OGRWriterTest, attrs_measure)
 
 TEST(OGRWriterTest, multicount)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/multicount.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "3");
-
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "multicount.shp");
 
     // 10 points in threes, with the remaining point in a last feature
     checkLayer(out, { wkbMultiPoint25D, 4, simpleExtent, simpleFirstPoint,
@@ -584,14 +419,12 @@ TEST(OGRWriterTest, multicount)
 TEST(OGRWriterTest, multicount_2)
 {
     // feature count < multicount
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/multicount_2.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "20");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "multicount_2.shp");
 
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
     checkLayer(out, { wkbMultiPoint25D, 1, simpleExtent, simpleFirstPoint,
         {}, { 10 }, "" });
 }
@@ -599,23 +432,18 @@ TEST(OGRWriterTest, multicount_2)
 TEST(OGRWriterTest, multicount_3)
 {
     // feature count == exact multiple of multicount
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/multicount_3.shp.ogrinfo");
-
     Options wo;
     wo.add("ogrdriver", "ESRI Shapefile");
     wo.add("multicount", "5");
+    std::string out = writeOgr(wo, Support::datapath("las/simple.las"),
+        "multicount_3.shp");
 
-    std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
     checkLayer(out, { wkbMultiPoint25D, 2, simpleExtent, simpleFirstPoint,
         {}, { 5, 5 }, "" });
 }
 
 TEST(OGRWriterTest, error_multicount_attrs)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/error");
-
     Options wo;
     wo.add("ogrdriver", "GeoJSON");
     wo.add("multicount", "3");
@@ -623,7 +451,7 @@ TEST(OGRWriterTest, error_multicount_attrs)
 
     try
     {
-        runOgrWriterInfo(wo, infile, infofile, ".geojson");
+        writeOgr(wo, Support::datapath("las/simple.las"), "error.geojson");
         FAIL() << "Expected an exception for an invalid arg combination";
     }
     catch (pdal_error const & err)
@@ -635,16 +463,13 @@ TEST(OGRWriterTest, error_multicount_attrs)
 
 TEST(OGRWriterTest, error_unknown_attr)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/error");
-
     Options wo;
     wo.add("ogrdriver", "GeoJSON");
     wo.add("attr_dims", "bananas");
 
     try
     {
-        runOgrWriterInfo(wo, infile, infofile, ".geojson");
+        writeOgr(wo, Support::datapath("las/simple.las"), "error.geojson");
         FAIL() << "Expected an exception for an invalid arg combination";
     }
     catch (pdal_error const & err)
@@ -656,9 +481,6 @@ TEST(OGRWriterTest, error_unknown_attr)
 
 TEST(OGRWriterTest, error_ogr)
 {
-    std::string infile = Support::datapath("las/simple.las");
-    std::string infofile = Support::datapath("ogr/error");
-
     Options wo;
     wo.add("ogrdriver", "GeoJSON");
 
@@ -670,7 +492,7 @@ TEST(OGRWriterTest, error_ogr)
         {
             gdal::ErrorHandlerSuspender devnull;
 
-            runOgrWriterInfo(wo, infile, infofile, ".geojson");
+            writeOgr(wo, Support::datapath("las/simple.las"), "error.geojson");
         }
         FAIL() << "Expected an exception from OGR";
     }
