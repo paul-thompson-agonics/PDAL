@@ -262,6 +262,52 @@ OGREnvelope envelope(double minx, double miny, double maxx, double maxy)
     return env;
 }
 
+// The first 10 points of las/simple.las, sorted by X
+const OGREnvelope simpleExtent(
+    envelope(635619.85, 849017.32, 635685.33, 852165.12));
+const std::vector<double> simpleFirstPoint { 635619.85, 850064.04, 447.01 };
+
+// The non-XYZ dimensions of las/simple.las, with the first point's values.
+// Shapefile cuts field names to 10 characters.
+std::vector<Field> simpleFields(bool shapefile, bool withClassification)
+{
+    struct Dim
+    {
+        const char *name;
+        const char *shpName;
+        OGRFieldType type;
+        double value;
+    };
+    static const Dim dims[] = {
+        { "Intensity", "Intensity", OFTInteger, 1 },
+        { "ReturnNumber", "ReturnNumb", OFTInteger, 1 },
+        { "NumberOfReturns", "NumberOfRe", OFTInteger, 2 },
+        { "ScanDirectionFlag", "ScanDirect", OFTInteger, 0 },
+        { "EdgeOfFlightLine", "EdgeOfFlig", OFTInteger, 0 },
+        { "Classification", "Classifica", OFTInteger, 1 },
+        { "Synthetic", "Synthetic", OFTInteger, 0 },
+        { "KeyPoint", "KeyPoint", OFTInteger, 0 },
+        { "Withheld", "Withheld", OFTInteger, 0 },
+        { "Overlap", "Overlap", OFTInteger, 0 },
+        { "ScanAngleRank", "ScanAngleR", OFTReal, 15 },
+        { "UserData", "UserData", OFTInteger, 125 },
+        { "PointSourceId", "PointSourc", OFTInteger, 7327 },
+        { "GpsTime", "GpsTime", OFTReal, 246092.20788099366473 },
+        { "Red", "Red", OFTInteger, 52 },
+        { "Green", "Green", OFTInteger, 65 },
+        { "Blue", "Blue", OFTInteger, 68 }
+    };
+
+    std::vector<Field> fields;
+    for (const Dim& d : dims)
+    {
+        if (!withClassification && std::string(d.name) == "Classification")
+            continue;
+        fields.push_back({ shapefile ? d.shpName : d.name, d.type, d.value });
+    }
+    return fields;
+}
+
 void checkLayer(const std::string& filename, const Expected& exp)
 {
     GDALDatasetUniquePtr ds(GDALDataset::Open(filename.c_str(),
@@ -368,12 +414,11 @@ TEST(OGRWriterTest, shapefile)
     wo.add("ogrdriver", "ESRI Shapefile");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbPoint25D, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        {},
-        {},
-        "" });
+
+    // writers.ogr creates the layer as Point ZM, but a Shapefile reports M
+    // only if the features have M values
+    checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
+        {}, {}, "" });
 }
 
 TEST(OGRWriterTest, json)
@@ -386,12 +431,10 @@ TEST(OGRWriterTest, json)
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson", 10,
         &diff_geojson);
-    checkLayer(out, { wkbPoint25D, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        {},
-        {},
-        "WGS 84" });
+
+    // GeoJSON has no M
+    checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
+        {}, {}, "WGS 84" });
 }
 
 TEST(OGRWriterTest, geopackage)
@@ -403,12 +446,11 @@ TEST(OGRWriterTest, geopackage)
     wo.add("ogrdriver", "GPKG");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
+
+    // GeoPackage keeps the layer's Point ZM type
     checkLayer(out, { wkbPointZM, 1,
         envelope(470692.44, 4602888.9, 470692.44, 4602888.9),
-        { 470692.44, 4602888.9, 16 },
-        {},
-        {},
-        "NAD83 / UTM zone 15N" });
+        { 470692.44, 4602888.9, 16 }, {}, {}, "NAD83 / UTM zone 15N" });
 }
 
 TEST(OGRWriterTest, creation_options)
@@ -428,13 +470,10 @@ TEST(OGRWriterTest, creation_options)
         std::string out = runOgrWriterInfo(wo, infile, infofile, ".geojson",
             10, &diff_geojson);
 
-    // both .ogrinfo files give these values
+    // COORDINATE_PRECISION=1 rounds coordinates to one decimal place
     checkLayer(out, { wkbPoint25D, 10,
         envelope(635619.8, 849017.3, 635685.3, 852165.1),
-        { 635619.8, 850064, 447 },
-        {},
-        {},
-        "WGS 84" });
+        { 635619.8, 850064, 447 }, {}, {}, "WGS 84" });
 }
 
 TEST(OGRWriterTest, shapefile_measure)
@@ -447,12 +486,8 @@ TEST(OGRWriterTest, shapefile_measure)
     wo.add("measure_dim", "Classification");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbPointZM, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01, 1 },
-        {},
-        {},
-        "" });
+    checkLayer(out, { wkbPointZM, 10, simpleExtent,
+        { 635619.85, 850064.04, 447.01, 1 }, {}, {}, "" });
 }
 
 TEST(OGRWriterTest, attrs_all)
@@ -465,28 +500,8 @@ TEST(OGRWriterTest, attrs_all)
     wo.add("attr_dims", "all");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbPoint25D, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        { { "Intensity", OFTInteger, 1 },
-          { "ReturnNumb", OFTInteger, 1 },
-          { "NumberOfRe", OFTInteger, 2 },
-          { "ScanDirect", OFTInteger, 0 },
-          { "EdgeOfFlig", OFTInteger, 0 },
-          { "Classifica", OFTInteger, 1 },
-          { "Synthetic", OFTInteger, 0 },
-          { "KeyPoint", OFTInteger, 0 },
-          { "Withheld", OFTInteger, 0 },
-          { "Overlap", OFTInteger, 0 },
-          { "ScanAngleR", OFTReal, 15 },
-          { "UserData", OFTInteger, 125 },
-          { "PointSourc", OFTInteger, 7327 },
-          { "GpsTime", OFTReal, 246092.20788099366473 },
-          { "Red", OFTInteger, 52 },
-          { "Green", OFTInteger, 65 },
-          { "Blue", OFTInteger, 68 } },
-        {},
-        "" });
+    checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
+        simpleFields(true, true), {}, "" });
 }
 
 TEST(OGRWriterTest, geopackage_attrs_all)
@@ -506,51 +521,11 @@ TEST(OGRWriterTest, geopackage_attrs_all)
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".gpkg");
 #if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3,9,0)
-    checkLayer(out, { wkbPointZM, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        { { "Intensity", OFTInteger, 1 },
-          { "ReturnNumber", OFTInteger, 1 },
-          { "NumberOfReturns", OFTInteger, 2 },
-          { "ScanDirectionFlag", OFTInteger, 0 },
-          { "EdgeOfFlightLine", OFTInteger, 0 },
-          { "Classification", OFTInteger, 1 },
-          { "Synthetic", OFTInteger, 0 },
-          { "KeyPoint", OFTInteger, 0 },
-          { "Withheld", OFTInteger, 0 },
-          { "Overlap", OFTInteger, 0 },
-          { "ScanAngleRank", OFTReal, 15 },
-          { "UserData", OFTInteger, 125 },
-          { "PointSourceId", OFTInteger, 7327 },
-          { "GpsTime", OFTReal, 246092.207880994 },
-          { "Red", OFTInteger, 52 },
-          { "Green", OFTInteger, 65 },
-          { "Blue", OFTInteger, 68 } },
-        {},
-        "" });
+    checkLayer(out, { wkbPointZM, 10, simpleExtent, simpleFirstPoint,
+        simpleFields(false, true), {}, "" });
 #else
-    checkLayer(out, { wkbPointZM, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        { { "Intensity", OFTInteger, 1 },
-          { "ReturnNumber", OFTInteger, 1 },
-          { "NumberOfReturns", OFTInteger, 2 },
-          { "ScanDirectionFlag", OFTInteger, 0 },
-          { "EdgeOfFlightLine", OFTInteger, 0 },
-          { "Classification", OFTInteger, 1 },
-          { "Synthetic", OFTInteger, 0 },
-          { "KeyPoint", OFTInteger, 0 },
-          { "Withheld", OFTInteger, 0 },
-          { "Overlap", OFTInteger, 0 },
-          { "ScanAngleRank", OFTReal, 15 },
-          { "UserData", OFTInteger, 125 },
-          { "PointSourceId", OFTInteger, 7327 },
-          { "GpsTime", OFTReal, 246092.207880994 },
-          { "Red", OFTInteger, 52 },
-          { "Green", OFTInteger, 65 },
-          { "Blue", OFTInteger, 68 } },
-        {},
-        "Undefined geographic SRS" });
+    checkLayer(out, { wkbPointZM, 10, simpleExtent, simpleFirstPoint,
+        simpleFields(false, true), {}, "Undefined geographic SRS" });
 #endif
 }
 
@@ -564,15 +539,10 @@ TEST(OGRWriterTest, attrs)
     wo.add("attr_dims", "Classification,Red,Green,Blue");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbPoint25D, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        { { "Classifica", OFTInteger, 1 },
-          { "Red", OFTInteger, 52 },
-          { "Green", OFTInteger, 65 },
-          { "Blue", OFTInteger, 68 } },
-        {},
-        "" });
+    checkLayer(out, { wkbPoint25D, 10, simpleExtent, simpleFirstPoint,
+        { { "Classifica", OFTInteger, 1 }, { "Red", OFTInteger, 52 },
+          { "Green", OFTInteger, 65 }, { "Blue", OFTInteger, 68 } },
+        {}, "" });
 }
 
 TEST(OGRWriterTest, attrs_measure)
@@ -586,27 +556,11 @@ TEST(OGRWriterTest, attrs_measure)
     wo.add("attr_dims", "all");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbPointZM, 10,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01, 1 },
-        { { "Intensity", OFTInteger, 1 },
-          { "ReturnNumb", OFTInteger, 1 },
-          { "NumberOfRe", OFTInteger, 2 },
-          { "ScanDirect", OFTInteger, 0 },
-          { "EdgeOfFlig", OFTInteger, 0 },
-          { "Synthetic", OFTInteger, 0 },
-          { "KeyPoint", OFTInteger, 0 },
-          { "Withheld", OFTInteger, 0 },
-          { "Overlap", OFTInteger, 0 },
-          { "ScanAngleR", OFTReal, 15 },
-          { "UserData", OFTInteger, 125 },
-          { "PointSourc", OFTInteger, 7327 },
-          { "GpsTime", OFTReal, 246092.20788099366473 },
-          { "Red", OFTInteger, 52 },
-          { "Green", OFTInteger, 65 },
-          { "Blue", OFTInteger, 68 } },
-        {},
-        "" });
+
+    // "all" leaves out the measure dimension, as it's already the M value
+    checkLayer(out, { wkbPointZM, 10, simpleExtent,
+        { 635619.85, 850064.04, 447.01, 1 }, simpleFields(true, false),
+        {}, "" });
 }
 
 TEST(OGRWriterTest, multicount)
@@ -619,12 +573,10 @@ TEST(OGRWriterTest, multicount)
     wo.add("multicount", "3");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbMultiPoint25D, 4,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        {},
-        { 3, 3, 3, 1 },
-        "" });
+
+    // 10 points in threes, with the remaining point in a last feature
+    checkLayer(out, { wkbMultiPoint25D, 4, simpleExtent, simpleFirstPoint,
+        {}, { 3, 3, 3, 1 }, "" });
 }
 
 TEST(OGRWriterTest, multicount_2)
@@ -638,12 +590,8 @@ TEST(OGRWriterTest, multicount_2)
     wo.add("multicount", "20");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbMultiPoint25D, 1,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        {},
-        { 10 },
-        "" });
+    checkLayer(out, { wkbMultiPoint25D, 1, simpleExtent, simpleFirstPoint,
+        {}, { 10 }, "" });
 }
 
 TEST(OGRWriterTest, multicount_3)
@@ -657,12 +605,8 @@ TEST(OGRWriterTest, multicount_3)
     wo.add("multicount", "5");
 
     std::string out = runOgrWriterInfo(wo, infile, infofile, ".shp");
-    checkLayer(out, { wkbMultiPoint25D, 2,
-        envelope(635619.85, 849017.32, 635685.33, 852165.12),
-        { 635619.85, 850064.04, 447.01 },
-        {},
-        { 5, 5 },
-        "" });
+    checkLayer(out, { wkbMultiPoint25D, 2, simpleExtent, simpleFirstPoint,
+        {}, { 5, 5 }, "" });
 }
 
 TEST(OGRWriterTest, error_multicount_attrs)
