@@ -474,6 +474,10 @@ TEST(OGRWriterTest, creation_options)
     checkLayer(out, { wkbPoint25D, 10,
         envelope(635619.8, 849017.3, 635685.3, 852165.1),
         { 635619.8, 850064, 447 }, {}, {}, nullptr });
+
+    // WRITE_BBOX=YES adds a bbox member to each feature
+    std::string text = FileUtils::readFileIntoString(out);
+    EXPECT_NE(text.find("\"bbox\""), std::string::npos);
 }
 
 TEST(OGRWriterTest, shapefile_measure)
