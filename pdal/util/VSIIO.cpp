@@ -32,6 +32,9 @@
 * OF SUCH DAMAGE.
 ****************************************************************************/
 
+// cpl_vsi_virtual.h in GDAL 3.10 and older uses uint8_t without including
+// <cstdint>, which fails to build with GCC 15
+#include <cstdint>
 #include <memory>
 #include <sstream>
 #include <streambuf>
