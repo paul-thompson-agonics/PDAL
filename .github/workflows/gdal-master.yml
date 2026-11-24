@@ -11,6 +11,7 @@ on:
         # Mondays at 06:17 UTC
         - cron: '17 6 * * 1'
     workflow_dispatch:
+    push:
 
 permissions:
     contents: read
