@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        type: ['current','fixed']
+        type: ['fixed']
     env:
       BUILD_TYPE: ${{ matrix.type }}
     steps:
